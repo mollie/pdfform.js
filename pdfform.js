@@ -216,18 +216,35 @@ write_xref_stream: function(out, prev, root_ref) {
 	var map = {
 		Type: new minipdf_lib.Name('XRef'),
 		Size: this.entries.length + 1, // + 1 for this object itself
-		Length: 6 * (this.entries.length + 1),
 		Root: root_ref,
 		W: [1, 4, 1],
+		Index: [],
 	};
 	if (prev !== undefined) {
 		map.Prev = prev;
 	}
 
+	var total_count = 0;
+	var need_new_index = true;
 	var bio = new BytesIO();
 	var entry = this.add('__xref_stream__', 0);
 	entry.offset = out.position();
-	this.entries.forEach(function(e) {
+	this.entries.forEach(function(e, idx) {
+		var is_new_entry = e.uncompressed === 'added';
+		if (!is_new_entry) {
+			need_new_index = true;
+			return;
+		}
+
+		total_count++;
+		if (need_new_index) {
+			need_new_index = false;
+			map.Index.push(idx);
+			map.Index.push(1);
+		} else {
+			map.Index[map.Index.length - 1]++;
+		}
+
 		assert(e.offset !== undefined, 'entry should have an offset');
 		bio.write_buf(new Uint8Array([
 			(e.uncompressed ? 1 : 2),
@@ -239,6 +256,8 @@ write_xref_stream: function(out, prev, root_ref) {
 		]));
 	});
 	var ui8ar = bio.get_uint8array();
+
+	map.Length = 6 * (total_count + 1);
 
 	var stream = minipdf_lib.newStream(map, ui8ar);
 	entry.obj = stream;
@@ -278,7 +297,14 @@ function visit_acroform_fields(doc, callback) {
 				n._pdfform_ref = ref;
 			}
 
-			if (n.map && n.map.Kids) {
+			if (n.map && n.map.Kids && n.map.Opt && n.map.FT && (n.map.FT.name === 'Btn')) {
+				// Radio button
+				n._pdfform_spec = {
+					type: 'radio',
+					options: n.map.Opt,
+				};
+				callback(n);
+			} else if (n.map && n.map.Kids) {
 				to_visit.push.apply(to_visit, n.map.Kids);
 			} else if (n.map && n.map.Type && n.map.Type.name == 'Annot' && n.map.T) {
 				callback(n);
@@ -347,7 +373,7 @@ function modify_xfa(doc, objects, out, index, callback) {
 	var prev_str = (new TextDecoder('utf-8')).decode(bs);
 
 	var str = callback(prev_str);
- 
+
 	var out_bs = (new TextEncoder('utf-8').encode(str));
 	var out_node = minipdf_lib.newStream(section_node.dict.map, out_bs);
 	assert(minipdf_lib.isStream(out_node));
@@ -358,6 +384,7 @@ function modify_xfa(doc, objects, out, index, callback) {
 
 function transform(buf, fields) {
 	var doc = minipdf_lib.parse(new Uint8Array(buf));
+	assert(doc.startXRef);
 	var objects = new PDFObjects(doc);
 	var root_id = doc.get_root_id();
 	var root_ref = new minipdf_lib.Ref(root_id, 0);
@@ -367,22 +394,47 @@ function transform(buf, fields) {
 
 	// Change AcroForms
 	visit_acroform_fields(doc, function(n) {
-		var spec = acroform_match_spec(n, fields);
-		if (spec === undefined) {
+		var value = acroform_match_spec(n, fields);
+		if (value === undefined) {
 			return;
 		}
 
-		var ft_name = n.map.FT.name;
-		if (ft_name == 'Tx') {
-			n.map.V = '' + spec;
-		} else if (ft_name == 'Btn') {
-			n.map.AS = n.map.V = n.map.DV = spec ? new minipdf_lib.Name('Yes') : new minipdf_lib.Name('Off');
-		} else if (ft_name == 'Ch') {
-			n.map.V =  '' + spec;
-		} else if (ft_name == 'Sig') {
-			return; // Signature fields are not supported so far
+		if (n._pdfform_spec) {
+			var type = n._pdfform_spec.type;
+			if (type === 'radio') {
+				var idx = n._pdfform_spec.options.indexOf(value);
+				if (idx === -1) return;
+
+				var kid_ref = n.map.Kids[idx];
+				if (!kid_ref) {
+					throw new Error('Cannot find kid #' + idx + ' (value=' + value + ')');
+				}
+				if (!minipdf_lib.isRef(kid_ref)) {
+					throw new Error('radio kid is not a reference');
+				}
+
+				var kid = doc.fetch(kid_ref);
+				kid.map.AS = kid.map.V = kid.map.DV = new minipdf_lib.Name('Yes');
+
+				var kid_entry = objects.update(kid_ref, kid);
+				objects.write_object(out, kid_entry);
+				return;
+			} else {
+				throw new Error('Unsupported spec type ' + type);
+			}
 		} else {
-			throw new Error('Unsupported input type ' + n.map.FT.name);
+			var ft_name = n.map.FT.name;
+			if (ft_name == 'Tx') {
+				n.map.V = '' + value;
+			} else if (ft_name == 'Btn') {
+				n.map.AS = n.map.V = n.map.DV = value ? new minipdf_lib.Name('Yes') : new minipdf_lib.Name('Off');
+			} else if (ft_name == 'Ch') {
+				n.map.V =  '' + value;
+			} else if (ft_name == 'Sig') {
+				return; // Signature fields are not supported so far
+			} else {
+				throw new Error('Unsupported input type ' + n.map.FT.name);
+			}
 		}
 
 		var ref = n._pdfform_ref;
@@ -430,7 +482,6 @@ function transform(buf, fields) {
 				el.appendChild(ds_doc.createTextNode(val));
 			}
 		}
-
 		str = new XMLSerializer().serializeToString(ds_doc);
 		return str;
 	});
@@ -464,20 +515,24 @@ function list_fields(data) {
 		}
 
 		var spec;
-		var ft_name = n.map.FT.name;
-		if (ft_name === 'Tx') {
-			spec = {type: 'string'};
-		} else if (ft_name === 'Btn') {
-			spec = {type: 'boolean'};
-		} else if (ft_name === 'Ch') {
-			spec = {
-				type: 'select',
-				options: n.map.Opt.slice(),
-			};
-		} else if (ft_name === 'Sig') {
-			return; // Signature names are not supported so far
+		if (n._pdfform_spec) {
+			spec = n._pdfform_spec;
 		} else {
-			throw new Error('Unsupported input type' + ft_name);
+			var ft_name = n.map.FT.name;
+			if (ft_name === 'Tx') {
+				spec = {type: 'string'};
+			} else if (ft_name === 'Btn') {
+				spec = {type: 'boolean'};
+			} else if (ft_name === 'Ch') {
+				spec = {
+					type: 'select',
+					options: n.map.Opt.slice(),
+				};
+			} else if (ft_name === 'Sig') {
+				return; // Signature names are not supported so far
+			} else {
+				throw new Error('Unsupported input type' + ft_name);
+			}
 		}
 
 		if (!res[name]) {

@@ -206,19 +206,51 @@ describe('minipdf parsing', function() {
 		assert.strictEqual(r.read_uint(4), 0xff1299ab);
 	});
 
-	it('a real file', function() {
-		var buf = fs.readFileSync(__dirname + '/data/Spielberichtsbogen_2BL.pdf');
-		var doc = new minipdf.PDFDocument(buf);
+	it('a real file', () => {
+		const buf = fs.readFileSync(__dirname + '/data/Spielberichtsbogen_2BL.pdf');
+		const doc = new minipdf.PDFDocument(buf);
 		assert.deepStrictEqual(doc.root.map.Type, new minipdf.Name('Catalog'));
 		assert(doc.acroForm);
 		assert(doc.acroForm.map.XFA);
 	});
 
-	it('missing trailer (https://github.com/phihag/pdfform.js/issues/8)', function() {
-		var buf = fs.readFileSync(__dirname + '/data/missing-trailer.pdf');
-		var doc = new minipdf.PDFDocument(buf);
+	it('missing trailer (https://github.com/phihag/pdfform.js/issues/8)', () => {
+		const buf = fs.readFileSync(__dirname + '/data/missing-trailer.pdf');
+		const doc = new minipdf.PDFDocument(buf);
 		assert.deepStrictEqual(doc.root.map.Type, new minipdf.Name('Catalog'));
 		assert(doc.acroForm);
+	});
+
+	it('Sparse index streams (https://github.com/phihag/pdfform.js/issues/19)', () => {
+		const buf = fs.readFileSync(__dirname + '/data/french-adobe-reader.pdf');
+		const doc = new minipdf.PDFDocument(buf);
+		assert.deepStrictEqual(doc.root.map.Type, new minipdf.Name('Catalog'));
+		assert(doc.acroForm);
+		assert(doc.acroForm.map.XFA);
+	});
+
+	it('Uncompressed/free entries in xref table (https://github.com/phihag/pdfform.js/issues/19)', () => {
+		// Test that file is read the same as PDF.js
+		const input = new Uint8Array(fs.readFileSync(__dirname + '/data/french-adobe-reader.pdf'));
+
+		const minipdf_doc = minipdf.parse(input);
+		const pdfjs_wrap = require('../minipdf_js.js');
+		const pdfjs_doc = pdfjs_wrap.parse(input);
+
+		const minipdf_xref_entries = minipdf_doc.get_xref_entries();
+		const pdfs_xref_entries = pdfjs_doc.get_xref_entries();
+
+		// Manually add the type
+		for (const e of pdfs_xref_entries) {
+			assert.strictEqual(e.type, undefined);
+			e.type = e.free ? 0 : (e.uncompressed ? 1 : 2);
+			if (!e.free) {
+				e.uncompressed = !! e.uncompressed;
+			}
+		}
+
+		assert.equal(minipdf_xref_entries.length, pdfs_xref_entries.length);
+		assert.deepStrictEqual(minipdf_xref_entries, pdfs_xref_entries);
 	});
 
 });
